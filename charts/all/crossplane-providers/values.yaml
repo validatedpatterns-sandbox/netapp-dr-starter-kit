@@ -1,0 +1,22 @@
+crossplane:
+  providers:
+    version: v2.4.0
+    # Sub-providers to install (each auto-pulls provider-family-aws)
+    packages:
+      - name: provider-family-aws
+        package: xpkg.upbound.io/upbound/provider-family-aws
+      - name: provider-aws-ec2
+        package: xpkg.upbound.io/upbound/provider-aws-ec2
+      - name: provider-aws-fsx
+        package: xpkg.upbound.io/upbound/provider-aws-fsx
+      - name: provider-aws-s3
+        package: xpkg.upbound.io/upbound/provider-aws-s3
+      - name: provider-aws-route53
+        package: xpkg.upbound.io/upbound/provider-aws-route53
+
+  providerConfig:
+    name: default
+    credentials:
+      secretName: aws-provider-creds
+      secretNamespace: crossplane-system
+      secretKey: credentials

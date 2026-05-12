@@ -1,0 +1,173 @@
+global:
+  providerConfigRef: default
+  # OpenShift ingress application DNS (ingress.config/cluster spec.domain).
+  # Used as router-default.<domain> for Route53 when route53Failover *IngressHostname are unset.
+  clusterDomain: ""
+  drClusterDomain: ""
+
+# AWS provider secret reference (aligned with values-global.yaml). Required for endpoint-watcher templates.
+crossplane:
+  providerConfig:
+    credentials:
+      secretName: aws-provider-creds
+      secretKey: credentials
+
+# ---------------------------------------------------------------------------
+# FSx for NetApp ONTAP
+# ---------------------------------------------------------------------------
+# Hub creates both local + peer FSx filesystems (hub-centric Crossplane model).
+# Secondary sets enabled: false (hub manages its FSx).
+fsxOntap:
+  enabled: true
+  region: us-west-1
+  fileSystemName: ""
+  storageCapacity: 1024
+  throughputCapacity: 1024
+  storageType: SSD
+  deploymentType: MULTI_AZ_1
+  weeklyMaintenanceStartTime: "7:01:00"
+  automaticBackupRetentionDays: 3
+  dailyAutomaticBackupStartTime: "01:00"
+
+  vpcId: ""
+  subnetIds: []
+  routeTableIds: []
+  preferredSubnetId: ""
+  allowedCidrs:
+    - "10.0.0.0/16"
+
+  svmName: SVM1
+  rootVolumeSecurityStyle: UNIX
+
+  passwordSecret:
+    name: fsx-credentials
+    namespace: crossplane-system
+    fsxAdminKey: fsx-admin-password
+    svmAdminKey: svm-admin-password
+
+  tags:
+    Environment: production
+    ManagedBy: Crossplane
+    Purpose: NetApp-DR
+
+  # Peer FSx (created by the hub for the DR cluster)
+  peer:
+    enabled: false
+    region: ""
+    fileSystemName: ""
+    vpcId: ""
+    subnetIds: []
+    routeTableIds: []
+    preferredSubnetId: ""
+    allowedCidrs: []
+    svmName: SVM2
+    rootVolumeSecurityStyle: UNIX
+
+# ---------------------------------------------------------------------------
+# FSx Endpoint Watcher
+# ---------------------------------------------------------------------------
+# Runs on BOTH clusters. Queries AWS FSx API to discover endpoint IPs,
+# then writes ConfigMaps and patches TridentBackendConfig at runtime.
+# This closes the loop: Crossplane creates FSx → watcher discovers IPs →
+# ontap-peering + Trident get configured automatically.
+endpointWatcher:
+  enabled: true
+  schedule: "*/3 * * * *"
+  image: image-registry.openshift-image-registry.svc:5000/crossplane-system/dr-tools:latest
+  local:
+    fileSystemName: ""
+    region: ""
+    svmName: SVM1
+  peer:
+    fileSystemName: ""
+    region: ""
+    svmName: SVM2
+
+# ---------------------------------------------------------------------------
+# DR Tools Image Build
+# ---------------------------------------------------------------------------
+# Builds a custom image combining openshift/tools with the AWS CLI v2.
+# The image is consumed by the endpoint watcher and AMR PostSync jobs.
+drToolsBuild:
+  enabled: true
+  name: dr-tools
+  imagePullers:
+    - trident-protect
+
+# ---------------------------------------------------------------------------
+# S3 -- Trident Protect AppVault bucket
+# ---------------------------------------------------------------------------
+s3AppVault:
+  enabled: true
+  bucketName: trident-protect-bucket
+  region: us-west-1
+  tags:
+    Environment: production
+    ManagedBy: Crossplane
+    Purpose: Trident-Protect-AppVault
+
+# ---------------------------------------------------------------------------
+# VPC Peering (cross-region)
+# ---------------------------------------------------------------------------
+vpcPeering:
+  enabled: false
+  prod:
+    region: us-west-1
+    vpcId: ""
+    vpcCidr: ""
+    clusterName: ""
+    routeTableIds: []
+  dr:
+    region: us-east-1
+    vpcId: ""
+    vpcCidr: ""
+    clusterName: ""
+    routeTableIds: []
+  enableDnsResolution: true
+  tags:
+    ManagedBy: Crossplane
+    Purpose: DR-VPC-Peering
+
+# ---------------------------------------------------------------------------
+# Route53 DR Failover
+# ---------------------------------------------------------------------------
+route53Failover:
+  enabled: false
+  # When false (default), one primary + one secondary health check is shared by all
+  # apps (same as terraform/route53-failover). This avoids duplicate HTTPS checks
+  # against the same router FQDN and reduces Crossplane/Route53 "already exists"
+  # failures when health check IDs churn. Set true only if apps need different
+  # health-check targets per app.
+  perAppHealthChecks: false
+  # When true and hostedZoneId is set (not createHostedZone), Record CRs get
+  # crossplane.io/external-name (Terraform import id) so Crossplane adopts existing
+  # failover records instead of failing with "already exists". Set false for a
+  # brand-new zone where those record sets truly do not exist yet.
+  importExistingRecords: true
+  domain: ""
+  # If false, you must set hostedZoneId to an existing public zone for `domain` (Crossplane cannot create records without it).
+  createHostedZone: true
+  hostedZoneId: ""
+  primaryIngressHostname: ""
+  secondaryIngressHostname: ""
+  # Defaults for HTTPS health checks when route53Failover.apps[].primaryHealthCheckFqdn / secondaryHealthCheckFqdn are omitted
+  primaryHealthCheckFqdn: ""
+  secondaryHealthCheckFqdn: ""
+  healthCheckPath: "/"
+  # When false (default), Route53 SECONDARY records have no health check. Primary-down
+  # DNS failover still targets DR ingress even if HTTPS to / on the DR router is non-2xx.
+  # Set true to require a passing secondary health check before serving DR.
+  attachSecondaryHealthCheck: false
+  # When true, Crossplane skips failover Records/HCs for apps; hub dr-dns-reconciler
+  # applies weighted CNAMEs from S3 (see docs/dns-follow-promoted-state.md).
+  followPromotedDns:
+    enabled: false
+  recordTtl: 60
+  apps: []
+  #  - name: boutique
+  #    primaryHealthCheckFqdn: frontend-boutique.apps.primary.example.com   # optional; falls back to primaryHealthCheckFqdn above
+  #    secondaryHealthCheckFqdn: frontend-boutique.apps.secondary.example.com
+  #    healthCheckPath: "/"
+  tags:
+    ManagedBy: Crossplane
+    Purpose: DR-Failover

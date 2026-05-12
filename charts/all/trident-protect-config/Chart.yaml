@@ -6,3 +6,16 @@ type: application
 
 version: 0.1.0
 appVersion: "25.10.0"
+
+# Optional DR spoke workloads (WordPress + Boutique) ship as subcharts so the DR
+# cluster only needs the trident-protect-config Argo CD Application—not separate
+# workload Applications. Enable with drSpokeWorkloads.enabled (values-secondary).
+dependencies:
+  - name: wordpress
+    version: 0.1.0
+    repository: file://../wordpress
+    condition: drSpokeWorkloads.enabled
+  - name: boutique
+    version: 0.0.5
+    repository: https://charts.validatedpatterns.io
+    condition: drSpokeWorkloads.enabled

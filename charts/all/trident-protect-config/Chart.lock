@@ -1,0 +1,9 @@
+dependencies:
+- name: wordpress
+  repository: file://../wordpress
+  version: 0.1.0
+- name: boutique
+  repository: https://charts.validatedpatterns.io
+  version: 0.0.5
+digest: sha256:776a668ac5151a7eb4c31c38b0db322241c4a4205c20765beb977add9b26d8bf
+generated: "2026-05-06T12:34:42.564841341+01:00"

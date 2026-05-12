@@ -1,18 +1,41 @@
-# The build-dr make target will update the configuration in tridentFSX
+# Schedules are source-cluster only (hub creates snapshots for replication)
+tridentProtect:
+  snapshots:
+    - name: init-boutique
+      applicationRef: boutique
+      appVaultRef: s3-appvault
+      reclaimPolicy: Delete
+    - name: init-wordpress
+      applicationRef: wordpress
+      appVaultRef: s3-appvault
+      reclaimPolicy: Delete
+  schedules:
+    - name: boutique-hourly
+      applicationRef: boutique
+      appVaultRef: s3-appvault
+      granularity: Hourly
+      minute: "0"
+      snapshotRetention: "24"
+      backupRetention: "7"
+    - name: wordpress-hourly
+      applicationRef: wordpress
+      appVaultRef: s3-appvault
+      granularity: Hourly
+      minute: "0"
+      snapshotRetention: "24"
+      backupRetention: "7"
+# FSx endpoint IPs are dynamically discovered by fsx-endpoint-watcher CronJob.
+# Only SVM names are needed here (deterministic, set by crossplane-setup).
 tridentFSX:
-  mgmtLIF: 198.19.101.6
-  clusterLIF: "198.19.101.16"
+  mgmtLIF: ""
+  clusterLIF: ""
   svm: SVM1
-  interclusterIPs:
-    - 10.0.132.84
-    - 10.0.156.208
+  interclusterIPs: []
   peer:
-    mgmtLIF: "198.19.222.237"
-    clusterLIF: "198.19.222.87"
-    svm: SVM1
-    interclusterIPs:
-      - 10.100.165.18
-      - 10.100.186.99
+    mgmtLIF: ""
+    clusterLIF: ""
+    svm: SVM2
+    interclusterIPs: []
 clusterGroup:
   name: hub
   argoCD:
@@ -43,11 +66,146 @@ clusterGroup:
             hs.message = "Awaiting TridentOrchestrator status."
           end
           return hs
+      # Crossplane FSx: Ready=False during AWS CREATING should be Progressing, not Degraded.
+      # Argo CD health Lua omits the global `string` table; use :lower() / :find() on string values.
+      - kind: OntapFileSystem
+        group: fsx.aws.upbound.io
+        check: |
+          hs = {}
+          local ready = nil
+          local synced = nil
+          local sync_msg = ""
+          local ready_msg = ""
+          local ready_reason = ""
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+            for i, c in ipairs(obj.status.conditions) do
+              if c.type == "Ready" then
+                ready = c.status
+                ready_reason = c.reason or ""
+                ready_msg = c.message or ""
+              elseif c.type == "Synced" then
+                synced = c.status
+                sync_msg = c.message or ""
+              end
+            end
+          end
+          if synced == "False" then
+            hs.status = "Degraded"
+            hs.message = "Provider sync failed"
+            if sync_msg ~= "" then
+              hs.message = hs.message .. ": " .. sync_msg
+            end
+            return hs
+          end
+          if ready == "True" then
+            hs.status = "Healthy"
+            hs.message = "FSx ONTAP filesystem is ready."
+            return hs
+          end
+          if ready == "False" then
+            local r = tostring(ready_reason or "")
+            local rl = r:lower()
+            if rl:find("error", 1, true) ~= nil or rl:find("fail", 1, true) ~= nil then
+              hs.status = "Degraded"
+              hs.message = ready_msg ~= "" and ready_msg or ready_reason
+              return hs
+            end
+            hs.status = "Progressing"
+            hs.message = "FSx filesystem provisioning: " .. (ready_reason or "in progress")
+            if ready_msg ~= "" then
+              hs.message = hs.message .. " - " .. ready_msg
+            end
+            return hs
+          end
+          hs.status = "Progressing"
+          hs.message = "Awaiting FSx OntapFileSystem status."
+          return hs
+      - kind: OntapStorageVirtualMachine
+        group: fsx.aws.upbound.io
+        check: |
+          hs = {}
+          local ready = nil
+          local synced = nil
+          local sync_msg = ""
+          local ready_msg = ""
+          local ready_reason = ""
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+            for i, c in ipairs(obj.status.conditions) do
+              if c.type == "Ready" then
+                ready = c.status
+                ready_reason = c.reason or ""
+                ready_msg = c.message or ""
+              elseif c.type == "Synced" then
+                synced = c.status
+                sync_msg = c.message or ""
+              end
+            end
+          end
+          if synced == "False" then
+            hs.status = "Degraded"
+            hs.message = "Provider sync failed"
+            if sync_msg ~= "" then
+              hs.message = hs.message .. ": " .. sync_msg
+            end
+            return hs
+          end
+          if ready == "True" then
+            hs.status = "Healthy"
+            hs.message = "FSx SVM is ready."
+            return hs
+          end
+          if ready == "False" then
+            local r = tostring(ready_reason or "")
+            local rl = r:lower()
+            if rl:find("error", 1, true) ~= nil or rl:find("fail", 1, true) ~= nil then
+              hs.status = "Degraded"
+              hs.message = ready_msg ~= "" and ready_msg or ready_reason
+              return hs
+            end
+            hs.status = "Progressing"
+            hs.message = "FSx SVM provisioning: " .. (ready_reason or "in progress")
+            if ready_msg ~= "" then
+              hs.message = hs.message .. " - " .. ready_msg
+            end
+            return hs
+          end
+          hs.status = "Progressing"
+          hs.message = "Awaiting FSx OntapStorageVirtualMachine status."
+          return hs
+    resourceActions:
+      - group: protect.trident.netapp.io
+        kind: AppMirrorRelationship
+        action: |
+          discovery.lua: |
+            actions = {}
+            actions["Failover"] = {["disabled"] = true}
+            actions["Resync"] = {["disabled"] = true}
+            if obj.spec ~= nil and obj.spec.desiredState ~= nil then
+              if obj.spec.desiredState == "Established" then
+                actions["Failover"]["disabled"] = false
+              elseif obj.spec.desiredState == "Promoted" then
+                actions["Resync"]["disabled"] = false
+              end
+            end
+            return actions
+          definitions:
+          - name: Failover
+            action.lua: |
+              obj.spec.desiredState = "Promoted"
+              return obj
+          - name: Resync
+            action.lua: |
+              obj.spec.desiredState = "Established"
+              return obj
   # Namespace is a dictionary for easier overriding (lists are supported as well)
   namespaces:
     open-cluster-management:
     vault:
-    golang-external-secrets:
+    external-secrets-operator:
+      operatorGroup: true
+      targetNamespaces: []
+    external-secrets:
+    crossplane-system:
     trident:
     trident-protect:
     openshift-cnv:
@@ -64,8 +222,13 @@ clusterGroup:
       namespace: openshift-operators
       channel: stable
       source: certified-operators
+    eso:
+      name: openshift-external-secrets-operator
+      namespace: external-secrets-operator
+      channel: stable-v1
   argoProjects:
     - hub
+    - crossplane
     - trident
     - workload
   # Explicitly mention the cluster-state based overrides we plan to use for this pattern.
@@ -73,22 +236,6 @@ clusterGroup:
   sharedValueFiles:
     - '/overrides/values-{{ $.Values.global.clusterPlatform }}.yaml'
     - '/overrides/values-{{ $.Values.global.clusterVersion }}-{{ $.Values.clusterGroup.name }}.yaml'
-  # sharedValueFiles is a flexible mechanism that will add the listed valuefiles to every app defined in the
-  # applications section. We intend this to supplement and possibly even replace previous "magic" mechanisms, though
-  # we do not at present have a target date for removal.
-  #
-  # To replicate the "classic" magic include structure, the clusterGroup would need all of these
-  # sharedValueFiles, in this order:
-  #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}.yaml'
-  #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}-{{ $.Values.global.clusterVersion }}.yaml'
-  #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}-{{ $.Values.clusterGroup.name }}.yaml'
-  #   - '/overrides/values-{{ $.Values.global.clusterVersion }}-{{ $.Values.clusterGroup.name }}.yaml"
-  #   - '/overrides/values-{{ $.Values.global.localClusterName }}.yaml'
-
-  # This kind of variable substitution will work with any of the variables the Validated Patterns operator knows
-  # about and sets, so this is also possible, for example:
-  #   - '/overrides/values-{{ $.Values.global.hubClusterDomain }}.yaml'
-  #   - '/overrides/values-{{ $.Values.global.localClusterDomain }}.yaml'
   applications:
     acm:
       name: acm
@@ -102,17 +249,64 @@ clusterGroup:
       argoProject: hub
       chart: hashicorp-vault
       chartVersion: 0.1.*
-    golang-external-secrets:
-      name: golang-external-secrets
-      namespace: golang-external-secrets
+    openshift-external-secrets:
+      name: openshift-external-secrets
+      namespace: external-secrets
       argoProject: hub
-      chart: golang-external-secrets
-      chartVersion: 0.1.*
+      chart: openshift-external-secrets
+      chartVersion: 0.0.*
+    crossplane:
+      name: crossplane
+      namespace: crossplane-system
+      argoProject: crossplane
+      path: charts/all/crossplane
+    crossplane-providers:
+      name: crossplane-providers
+      namespace: crossplane-system
+      argoProject: crossplane
+      path: charts/all/crossplane-providers
+    crossplane-aws-infra:
+      name: crossplane-aws-infra
+      namespace: crossplane-system
+      argoProject: crossplane
+      path: charts/all/crossplane-aws-infra
+      ignoreDifferences:
+        - group: route53.aws.upbound.io
+          kind: Record
+          jqPathExpressions:
+            - .spec.forProvider.healthCheckId
+        - group: route53.aws.upbound.io
+          kind: HealthCheck
+          jqPathExpressions:
+            - .spec.forProvider.enableSni
+            - .spec.forProvider.tags
+        - group: ec2.aws.upbound.io
+          kind: VPCPeeringConnectionOptions
+          jqPathExpressions:
+            - .spec.managementPolicies
+    dr-dns-reconciler:
+      name: dr-dns-reconciler
+      namespace: crossplane-system
+      argoProject: crossplane
+      path: charts/all/dr-dns-reconciler
+      syncPolicy:
+        automated:
+          selfHeal: true
+        retry:
+          limit: 5
     trident:
       name: trident
       namespace: trident
       path: charts/all/trident
       argoProject: trident
+      ignoreDifferences:
+        - group: trident.netapp.io
+          kind: TridentBackendConfig
+          jqPathExpressions:
+            - .spec.managementLIF
+            - .spec.svm
+            - .spec.replication
+            - .metadata.annotations
     protect:
       name: trident-protect
       namespace: trident-protect
@@ -130,21 +324,45 @@ clusterGroup:
           name: trident-protect-validating-webhook-configurations
           jqPathExpressions:
             - '.webhooks[].clientConfig.caBundle'
+            - '.metadata.finalizers[]'
     protect-config:
       name: trident-protect-config
       namespace: trident-protect
       argoProject: trident
       path: charts/all/trident-protect-config
+      syncPolicy:
+        automated:
+          selfHeal: true
+        retry:
+          limit: 20
+      ignoreDifferences:
+        - group: protect.trident.netapp.io
+          kind: AppMirrorRelationship
+          jqPathExpressions:
+            - .spec.sourceApplicationUID
+            - .spec.desiredState
     wordpress:
       name: wordpress
       namespace: wordpress
       argoProject: workload
       path: charts/all/wordpress
+    dr-monitoring:
+      name: dr-monitoring
+      namespace: openshift-monitoring
+      argoProject: trident
+      path: charts/all/dr-monitoring
+      overrides:
+        - name: drMonitoring.clusterRole
+          value: hub
     boutique:
       name: boutique
       namespace: boutique
+      chart: boutique
+      chartVersion: 0.0.*
       argoProject: workload
-      path: charts/all/boutique
+      overrides:
+        - name: global.storageClass
+          value: storage-class-nfs
   imperative:
     # NOTE: We *must* use lists and not hashes. As hashes lose ordering once parsed by helm
     # The default schedule is every 10 minutes: imperative.schedule
@@ -165,80 +383,97 @@ clusterGroup:
       acmlabels:
         - name: clusterGroup
           value: secondary
-          # helmOverrides:
-          #   - name: foo
-          #     value: bar
-          # Before enabling cluster provisioning, ensure AWS and/or Azure
-          #   credentials and OCP pull secrets are defined in Vault.
-          #   See values-secret.yaml.template
-          #
-          # clusterPools:
-          #  exampleAWSPool:
-          #    name: aws-ap
-          #    openshiftVersion: 4.10.18
-          #    baseDomain: blueprints.rhecoeng.com
-          #    platform:
-          #      aws:
-          #        region: ap-southeast-2
-          #    clusters:
-          #    - One
-          #
-          #  exampleAzurePool:
-          #    name: azure-us
-          #    openshiftVersion: 4.10.18
-          #    baseDomain: blueprints.rhecoeng.com
-          #    platform:
-          #      azure:
-          #        baseDomainResourceGroupName: dojo-dns-zones
-          #        region: eastus
-          #    clusters:
-          #    - Two
-          #    - Three
-#  To have apps in multiple flavors, use namespaces and use helm overrides as appropriate
-#
-#    pipelines:
-#      name: pipelines
-#      namespace: production
-#      project: datacenter
-#      path: applications/pipeline
-#      repoURL: https://github.com/you/applications.git
-#      targetRevision: stable
-#      overrides:
-#      - name: myparam
-#        value: myparam
-#
-#    pipelines_staging:
-#    - name: pipelines
-#      namespace: staging
-#      project: datacenter
-#      path: applications/pipeline
-#      repoURL: https://github.com/you/applications.git
-#      targetRevision: main
-#
-#   Additional applications
-#   Be sure to include additional resources your apps will require
-#   +X machines
-#   +Y RAM
-#   +Z CPU
-#    vendor-app:
-#      name: vendor-app
-#      namespace: default
-#      project: vendor
-#      path: path/to/myapp
-#      repoURL: https://github.com/vendor/applications.git
-#      targetRevision: main
-#  managedSites:
-#    factory:
-#      name: factory
-#      # repoURL: https://github.com/dagger-refuse-cool/manuela-factory.git
-#      targetRevision: main
-#      path: applications/factory
-#      helmOverrides:
-#      - name: foo
-#        value: bar
-#      clusterSelector:
-#        matchExpressions:
-#        - key: vendor
-#          operator: In
-#          values:
-#            - OpenShift
+
+# The hub cluster has the FSx ONTAP filesystem and S3 AppVault; these are not replicated to the
+# DR cluster but can be used as sources for replication to other clusters in the pattern.
+fsxOntap:
+  enabled: true
+  region: "" # Provided by crossplane-setup
+  fileSystemName: "" # Provided by crossplane-setup
+  vpcId: "" # Provided by crossplane-setup
+  subnetIds: []
+  routeTableIds: []
+  preferredSubnetId: "" # Provided by crossplane-setup
+  allowedCidrs: []
+  storageCapacity: 1024
+  throughputCapacity: 1024
+  storageType: SSD
+  deploymentType: MULTI_AZ_1
+  svmName: SVM1
+  peer:
+    enabled: true
+    region: "" # Provided by crossplane-setup
+    fileSystemName: "" # Provided by crossplane-setup
+    vpcId: "" # Provided by crossplane-setup
+    subnetIds: []
+    routeTableIds: []
+    preferredSubnetId: "" # Provided by crossplane-setup
+    allowedCidrs: []
+    svmName: SVM2
+s3AppVault:
+  enabled: true
+  bucketName: "" # Matches .Values.tridentProtect.appVault.name in values-global.yaml; provided by crossplane-setup
+  region: "" # Provided by crossplane-setup
+endpointWatcher:
+  enabled: true
+  local:
+    fileSystemName: "" # Provided by crossplane-setup
+    region: "" # Provided by crossplane-setup
+    svmName: SVM1
+  peer:
+    fileSystemName: "" # Provided by crossplane-setup
+    region: "" # Provided by crossplane-setup
+    svmName: SVM2
+vpcPeering:
+  enabled: true
+  prod:
+    region: "" # Provided by crossplane-setup
+    vpcId: "" # Provided by crossplane-setup
+    vpcCidr: "" # Provided by crossplane-setup
+    clusterName: "" # Provided by crossplane-setup
+    routeTableIds: []
+  dr:
+    region: "" # Provided by crossplane-setup
+    vpcId: "" # Provided by crossplane-setup
+    vpcCidr: "" # Provided by crossplane-setup
+    clusterName: "" # Provided by crossplane-setup
+    routeTableIds: []
+route53Failover:
+  enabled: true
+  perAppHealthChecks: false
+  followPromotedDns:
+    enabled: true
+  # Omit secondary health check so DNS follows primary-down (AMR Failover) without
+  # requiring a 2xx/3xx from the DR router on healthCheckPath. Set true to gate DR on probe success.
+  attachSecondaryHealthCheck: false
+  domain: dr.example.com # Provided by crossplane-setup; auto-derived from cluster DNS if omitted
+  # If false: set hostedZoneId to the Route53 zone ID for `domain` (see ansible dr_failover_hosted_zone_id or AWS console).
+  # If true: Crossplane creates the zone; delegate NS at the parent registrar.
+  createHostedZone: false
+  hostedZoneId: "" # Provided by crossplane-setup or set to existing zone ID if createHostedZone is false
+  # Router targets default to router-default.<domain> where templates now prefer:
+  # global.localClusterDomain (primary) and global.drClusterDomain (secondary).
+  # You can still override per environment with primaryIngressHostname/secondaryIngressHostname.
+  healthCheckPath: /
+  # Per-app primaryHealthCheckFqdn / secondaryHealthCheckFqdn are optional; these apply to all apps when omitted.
+  apps:
+    - name: boutique
+    - name: wordpress
+  region: us-west-1
+# Hub: weighted Route53 from S3 (dr-dns-state-export on DR). Requires IAM on aws-provider creds.
+drDnsReconciler:
+  enabled: true
+  namespace: crossplane-system
+  schedule: "*/1 * * * *"
+  s3Bucket: trident-protect-bucket
+  s3Region: us-west-1
+  s3Key: dr-metadata/amr-dns-target.json
+  hostedZoneId: "" # Provided by crossplane-setup or set to existing zone ID if createHostedZone is false
+  domain: dr.example.com # Provided by crossplane-setup; auto-derived from cluster DNS if omitted
+  # PRIMARY_INGRESS/SECONDARY_INGRESS now default from:
+  # global.localClusterDomain (preferred) + global.drClusterDomain.
+  # You can override with primaryIngressHostname/secondaryIngressHostname if needed.
+  recordTtl: 60
+  apps:
+    - name: boutique
+    - name: wordpress

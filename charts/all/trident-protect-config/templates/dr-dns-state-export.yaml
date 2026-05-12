@@ -1,0 +1,133 @@
+{{- if and .Values.drDnsStateExport.enabled .Values.tridentProtect.appMirrorRelationships (gt (len .Values.tridentProtect.appMirrorRelationships) 0) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-dns-state-export-script
+  namespace: trident-protect
+  labels:
+    app.kubernetes.io/name: dr-dns-state-export
+data:
+  export.py: |
+    #!/usr/bin/env python3
+    """Publish per-app AMR desiredState to S3 for hub dr-dns-reconciler."""
+    import json, os, ssl, subprocess, sys, tempfile
+    import urllib.request
+    import urllib.error
+
+    TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    API = "https://kubernetes.default.svc"
+    AMRS = json.loads(os.environ.get("AMR_DEFINITIONS", "[]"))
+    BUCKET = os.environ["S3_BUCKET"]
+    REGION = os.environ["S3_REGION"]
+    KEY = os.environ["S3_KEY"]
+
+    CTX = ssl.create_default_context()
+    CTX.check_hostname = False
+    CTX.verify_mode = ssl.CERT_NONE
+
+    def kube_get(path):
+        token = open(TOKEN_PATH).read().strip()
+        req = urllib.request.Request(
+            f"{API}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            return json.loads(urllib.request.urlopen(req, context=CTX).read())
+        except urllib.error.HTTPError as e:
+            print(f"  API error {e.code}: {e.read().decode()}", file=sys.stderr)
+            return None
+
+    apps = {}
+    for amr in AMRS:
+        name = amr["name"]
+        ns = amr.get("sourceApplicationNamespace") or amr["sourceApplicationName"]
+        base = f"/apis/protect.trident.netapp.io/v1/namespaces/{ns}"
+        data = kube_get(f"{base}/appmirrorrelationships/{name}")
+        if not data or "spec" not in data:
+            print(f"  WARN: missing AMR {ns}/{name}", file=sys.stderr)
+            continue
+        spec = data["spec"]
+        app = spec.get("sourceApplicationName") or name
+        ds = spec.get("desiredState") or "Established"
+        apps[app] = ds
+        print(f"  {app} (AMR {name}): {ds}")
+
+    out = {"schemaVersion": 1, "apps": apps}
+    path = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+    try:
+        json.dump(out, path, indent=2)
+        path.close()
+        r = subprocess.run(
+            ["aws", "s3", "cp", path.name, f"s3://{BUCKET}/{KEY}", "--region", REGION],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            print(f"S3 upload failed: {r.stderr}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Published {len(apps)} app(s) to s3://{BUCKET}/{KEY}")
+    finally:
+        try:
+            os.unlink(path.name)
+        except OSError:
+            pass
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dr-dns-state-export
+  namespace: trident-protect
+  labels:
+    app.kubernetes.io/name: dr-dns-state-export
+spec:
+  schedule: {{ .Values.drDnsStateExport.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: dr-dns-state-export
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: trident-protect-amr-reconcile
+          containers:
+            - name: export
+              image: {{ .Values.tridentProtect.amrPostSync.image | default "image-registry.openshift-image-registry.svc:5000/crossplane-system/dr-tools:latest" }}
+              command: ["python3", "/scripts/export.py"]
+              env:
+                - name: AMR_DEFINITIONS
+                  value: {{ .Values.tridentProtect.appMirrorRelationships | toJson | quote }}
+                - name: S3_BUCKET
+                  value: {{ .Values.tridentProtect.appVault.s3.bucketName | quote }}
+                - name: S3_REGION
+                  value: {{ .Values.tridentProtect.appVault.s3.region | quote }}
+                - name: S3_KEY
+                  value: {{ .Values.drDnsStateExport.s3Key | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.tridentProtect.appVault.credentials.secretName }}
+                      key: accessKeyID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.tridentProtect.appVault.credentials.secretName }}
+                      key: secretAccessKey
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: scripts
+              configMap:
+                name: dr-dns-state-export-script
+                items:
+                  - key: export.py
+                    path: export.py
+{{- end }}

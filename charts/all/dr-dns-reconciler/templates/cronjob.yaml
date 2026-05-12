@@ -1,0 +1,82 @@
+{{- if .Values.drDnsReconciler.enabled }}
+{{- $c := .Values.drDnsReconciler }}
+{{- $g := .Values.global | default dict }}
+{{- $primaryDomain := (coalesce $g.localClusterDomain $g.clusterDomain) }}
+{{- $secondaryDomain := (coalesce $g.drClusterDomain $g.hubClusterDomain) }}
+{{- $primaryIngress := include "dr-dns-reconciler.routerHostname" (dict "explicit" $c.primaryIngressHostname "domain" $primaryDomain) | trim }}
+{{- $secondaryIngress := include "dr-dns-reconciler.routerHostname" (dict "explicit" $c.secondaryIngressHostname "domain" $secondaryDomain) | trim }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dr-dns-reconciler
+  namespace: {{ $c.namespace }}
+  labels:
+    {{- include "dr-dns-reconciler.labels" $ | nindent 4 }}
+spec:
+  schedule: {{ $c.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            {{- include "dr-dns-reconciler.labels" $ | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: dr-dns-reconciler
+          containers:
+            - name: reconcile
+              image: {{ $c.image | quote }}
+              command: ["python3", "/scripts/reconcile.py"]
+              env:
+                - name: AWS_SHARED_CREDENTIALS_FILE
+                  value: /aws/credentials
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "true"
+                - name: ROUTE53_HOSTED_ZONE_ID
+                  value: {{ required "drDnsReconciler.hostedZoneId" $c.hostedZoneId | quote }}
+                - name: ROUTE53_DOMAIN
+                  value: {{ required "drDnsReconciler.domain" $c.domain | quote }}
+                - name: PRIMARY_INGRESS
+                  value: {{ required "Set global.localClusterDomain (preferred) or global.clusterDomain, or drDnsReconciler.primaryIngressHostname" $primaryIngress | quote }}
+                - name: SECONDARY_INGRESS
+                  value: {{ required "Set global.drClusterDomain (preferred) or global.hubClusterDomain, or drDnsReconciler.secondaryIngressHostname" $secondaryIngress | quote }}
+                - name: S3_BUCKET
+                  value: {{ required "drDnsReconciler.s3Bucket" $c.s3Bucket | quote }}
+                - name: S3_REGION
+                  value: {{ required "drDnsReconciler.s3Region" $c.s3Region | quote }}
+                - name: S3_KEY
+                  value: {{ $c.s3Key | quote }}
+                - name: ROUTE53_RECORD_TTL
+                  value: {{ $c.recordTtl | toString | quote }}
+                - name: WEIGHT_ACTIVE
+                  value: {{ $c.weightActive | toString | quote }}
+                - name: WEIGHT_STANDBY
+                  value: {{ $c.weightStandby | toString | quote }}
+                - name: ROUTE53_APPS_JSON
+                  value: {{ include "dr-dns-reconciler.appsJson" . | quote }}
+              volumeMounts:
+                - name: aws-creds
+                  mountPath: /aws
+                  readOnly: true
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: aws-creds
+              secret:
+                secretName: {{ $c.awsCredentialsSecret.name }}
+                items:
+                  - key: {{ $c.awsCredentialsSecret.credentialsKey | default "credentials" }}
+                    path: credentials
+            - name: scripts
+              configMap:
+                name: dr-dns-reconcile-script
+                items:
+                  - key: reconcile.py
+                    path: reconcile.py
+{{- end }}

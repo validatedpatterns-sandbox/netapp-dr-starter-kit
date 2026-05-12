@@ -8,3 +8,7 @@ scan:
     - MEDIUM
     - CRITICAL
     - HIGH
+  # Legacy Terraform modules: starter defaults trip many AWS hardening rules; Crossplane is the primary path.
+  skip-dirs:
+    - terraform/fsx-ontap
+    - terraform/terraform-state

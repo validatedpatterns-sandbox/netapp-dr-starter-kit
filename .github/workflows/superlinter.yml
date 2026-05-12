@@ -21,6 +21,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # When VALIDATE_TRIVY is true, super-linter runs `helm template` on charts; Crossplane is a wrapper chart and needs dependencies present.
+      - name: Helm dependency build (crossplane)
+        run: |
+          helm repo add crossplane-stable https://charts.crossplane.io/stable --force-update
+          helm dependency build charts/all/crossplane
+
       ################################
       # Run Linter against code base #
       ################################
@@ -35,6 +41,7 @@ jobs:
           VALIDATE_BASH: false
           VALIDATE_CHECKOV: false
           VALIDATE_JSCPD: false
+          # JSON is formatted with Biome in super-linter v8. Local parity: npm ci && npm run lint:biome (see package.json / biome.json).
           VALIDATE_JSON_PRETTIER: false
           VALIDATE_MARKDOWN_PRETTIER: false
           VALIDATE_PYTHON_PYLINT: false

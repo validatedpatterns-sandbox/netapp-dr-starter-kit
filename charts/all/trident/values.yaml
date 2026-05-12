@@ -2,6 +2,10 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+# Required by templates (e.g. TridentBackendConfig metadata); overridden per cluster by values-hub / values-secondary.
+clusterGroup:
+  name: hub
+
 # ExternalSecret Configuration
 secretStoreRef:
   name: vault-backend

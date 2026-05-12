@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dr-dns-reconciler
+description: Hub CronJob — Route53 weighted CNAMEs from DR-published AMR desiredState (S3)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

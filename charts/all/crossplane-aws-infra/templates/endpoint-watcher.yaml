@@ -1,0 +1,253 @@
+{{- if .Values.endpointWatcher.enabled }}
+{{- $w := .Values.endpointWatcher }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fsx-endpoint-watcher
+  namespace: crossplane-system
+spec:
+  schedule: {{ $w.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 180
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 120
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: fsx-endpoint-watcher
+          containers:
+            - name: watcher
+              image: {{ $w.image }}
+              env:
+                - name: LOCAL_FSX_NAME
+                  value: {{ $w.local.fileSystemName | quote }}
+                - name: LOCAL_REGION
+                  value: {{ $w.local.region | quote }}
+                - name: LOCAL_SVM_NAME
+                  value: {{ $w.local.svmName | quote }}
+                - name: PEER_FSX_NAME
+                  value: {{ $w.peer.fileSystemName | quote }}
+                - name: PEER_REGION
+                  value: {{ $w.peer.region | quote }}
+                - name: PEER_SVM_NAME
+                  value: {{ $w.peer.svmName | quote }}
+                - name: AWS_SHARED_CREDENTIALS_FILE
+                  value: /aws/credentials
+                - name: CLUSTER_ROLE
+                  value: {{ (.Values.clusterGroup).name | default "hub" | quote }}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+
+                  K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                  K8S_API="https://kubernetes.default.svc"
+
+                  kube_apply_configmap() {
+                    local ns="$1" name="$2" data_json="$3"
+                    local payload="{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"${name}\",\"namespace\":\"${ns}\"},\"data\":${data_json}}"
+                    curl -sk -o /dev/null -w '%{http_code}' -X PATCH \
+                      "${K8S_API}/api/v1/namespaces/${ns}/configmaps/${name}?fieldManager=fsx-watcher&force=true" \
+                      -H "Authorization: Bearer ${K8S_TOKEN}" \
+                      -H "Content-Type: application/apply-patch+yaml" \
+                      -d "${payload}"
+                  }
+
+                  kube_list_tbc() {
+                    curl -sk -H "Authorization: Bearer ${K8S_TOKEN}" \
+                      "${K8S_API}/apis/trident.netapp.io/v1/namespaces/trident/tridentbackendconfigs" 2>/dev/null
+                  }
+
+                  kube_patch_tbc() {
+                    local name="$1" patch="$2"
+                    curl -sk -o /dev/null -w '%{http_code}' -X PATCH \
+                      "${K8S_API}/apis/trident.netapp.io/v1/namespaces/trident/tridentbackendconfigs/${name}" \
+                      -H "Authorization: Bearer ${K8S_TOKEN}" \
+                      -H "Content-Type: application/merge-patch+json" \
+                      -d "${patch}"
+                  }
+
+                  echo "=== FSx Endpoint Watcher ($(date -u +%H:%M:%S)) ==="
+                  echo "  Local: ${LOCAL_FSX_NAME} (${LOCAL_REGION}) SVM=${LOCAL_SVM_NAME}"
+                  echo "  Peer:  ${PEER_FSX_NAME} (${PEER_REGION}) SVM=${PEER_SVM_NAME}"
+                  echo "  Role:  ${CLUSTER_ROLE}"
+
+                  lookup_fsx() {
+                    local fs_name="$1" region="$2" svm_name="$3" prefix="$4"
+
+                    FS_JSON=$(aws fsx describe-file-systems --region "${region}" \
+                      --query "FileSystems[?Tags[?Key=='Name'&&Value=='${fs_name}']]|[0]" \
+                      --output json 2>/dev/null || echo "null")
+
+                    if [ "${FS_JSON}" = "null" ] || [ -z "${FS_JSON}" ]; then
+                      echo "  ${prefix}: FSx '${fs_name}' not found or not ready"
+                      return 1
+                    fi
+
+                    LIFECYCLE=$(echo "${FS_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Lifecycle',''))" 2>/dev/null)
+                    if [ "${LIFECYCLE}" != "AVAILABLE" ]; then
+                      echo "  ${prefix}: FSx lifecycle=${LIFECYCLE}, waiting..."
+                      return 1
+                    fi
+
+                    FS_ID=$(echo "${FS_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin)['FileSystemId'])")
+                    CLUSTER_LIF=$(echo "${FS_JSON}" | python3 -c "
+                  import sys,json
+                  d=json.load(sys.stdin)
+                  eps=d.get('OntapConfiguration',{}).get('Endpoints',{})
+                  print(eps.get('Management',{}).get('IpAddresses',[''])[0])")
+
+                    IC_IPS=$(echo "${FS_JSON}" | python3 -c "
+                  import sys,json
+                  d=json.load(sys.stdin)
+                  eps=d.get('OntapConfiguration',{}).get('Endpoints',{})
+                  ips=eps.get('Intercluster',{}).get('IpAddresses',[])
+                  print(json.dumps(ips))")
+
+                    SVM_JSON=$(aws fsx describe-storage-virtual-machines --region "${region}" \
+                      --filters "Name=file-system-id,Values=${FS_ID}" \
+                      --query "StorageVirtualMachines[?Name=='${svm_name}']|[0]" \
+                      --output json 2>/dev/null || echo "null")
+
+                    MGMT_LIF=""
+                    if [ "${SVM_JSON}" != "null" ] && [ -n "${SVM_JSON}" ]; then
+                      MGMT_LIF=$(echo "${SVM_JSON}" | python3 -c "
+                  import sys,json
+                  d=json.load(sys.stdin)
+                  eps=d.get('Endpoints',{})
+                  print(eps.get('Management',{}).get('IpAddresses',[''])[0])" 2>/dev/null)
+                    fi
+
+                    echo "  ${prefix}: clusterLIF=${CLUSTER_LIF} mgmtLIF=${MGMT_LIF} IC=${IC_IPS}"
+
+                    eval "${prefix}_CLUSTER_LIF='${CLUSTER_LIF}'"
+                    eval "${prefix}_MGMT_LIF='${MGMT_LIF}'"
+                    eval "${prefix}_IC_IPS='${IC_IPS}'"
+                    eval "${prefix}_SVM='${svm_name}'"
+                    return 0
+                  }
+
+                  LOCAL_OK=false
+                  PEER_OK=false
+
+                  if lookup_fsx "${LOCAL_FSX_NAME}" "${LOCAL_REGION}" "${LOCAL_SVM_NAME}" "LOCAL"; then
+                    LOCAL_OK=true
+                  fi
+
+                  if lookup_fsx "${PEER_FSX_NAME}" "${PEER_REGION}" "${PEER_SVM_NAME}" "PEER"; then
+                    PEER_OK=true
+                  fi
+
+                  if [ "${LOCAL_OK}" != "true" ]; then
+                    echo "Local FSx not ready — will retry next schedule"
+                    exit 0
+                  fi
+
+                  echo ""
+                  echo "--- Creating ConfigMaps ---"
+
+                  CM_DATA=$(python3 -c "
+                  import json
+                  data = {
+                      'LOCAL_CLUSTER_LIF': '${LOCAL_CLUSTER_LIF}',
+                      'LOCAL_MGMT_LIF': '${LOCAL_MGMT_LIF}',
+                      'LOCAL_SVM': '${LOCAL_SVM}',
+                      'LOCAL_IC_IPS': '${LOCAL_IC_IPS}',
+                      'PEER_CLUSTER_LIF': '${PEER_CLUSTER_LIF:-}',
+                      'PEER_MGMT_LIF': '${PEER_MGMT_LIF:-}',
+                      'PEER_SVM': '${PEER_SVM:-}',
+                      'PEER_IC_IPS': '${PEER_IC_IPS:-[]}',
+                  }
+                  print(json.dumps(data))
+                  ")
+
+                  for NS in trident-protect trident; do
+                    HTTP=$(kube_apply_configmap "${NS}" "fsx-endpoints" "${CM_DATA}")
+                    echo "  ConfigMap fsx-endpoints in ${NS}: HTTP ${HTTP}"
+                  done
+
+                  echo ""
+                  echo "--- Patching TridentBackendConfigs ---"
+
+                  TBC_JSON=$(kube_list_tbc)
+                  TBC_NAMES=$(echo "${TBC_JSON}" | python3 -c "
+                  import sys,json
+                  try:
+                      items = json.load(sys.stdin).get('items',[])
+                      for i in items:
+                          print(i['metadata']['name'])
+                  except:
+                      pass
+                  " 2>/dev/null)
+
+                  if [ -n "${TBC_NAMES}" ]; then
+                    for TBC in ${TBC_NAMES}; do
+                      echo "  Patching ${TBC}..."
+                      PATCH="{\"spec\":{\"managementLIF\":\"${LOCAL_MGMT_LIF}\",\"svm\":\"${LOCAL_SVM}\""
+                      if [ "${PEER_OK}" = "true" ]; then
+                        PATCH="${PATCH},\"replication\":{\"isReplicationEnabled\":true,\"remoteSVMName\":\"${PEER_SVM}\"}"
+                      fi
+                      PATCH="${PATCH}}}"
+                      HTTP=$(kube_patch_tbc "${TBC}" "${PATCH}")
+                      echo "    HTTP ${HTTP}"
+                    done
+                  else
+                    echo "  No TridentBackendConfigs found yet — will retry"
+                  fi
+
+                  echo ""
+                  echo "--- Triggering ArgoCD refresh for dependent apps ---"
+
+                  kube_refresh_argocd_app() {
+                    local ns="$1" name="$2"
+                    local patch="{\"metadata\":{\"annotations\":{\"argocd.argoproj.io/refresh\":\"hard\"}}}"
+                    curl -sk -o /dev/null -w '%{http_code}' -X PATCH \
+                      "${K8S_API}/apis/argoproj.io/v1alpha1/namespaces/${ns}/applications/${name}" \
+                      -H "Authorization: Bearer ${K8S_TOKEN}" \
+                      -H "Content-Type: application/merge-patch+json" \
+                      -d "${patch}"
+                  }
+
+                  ARGO_APPS=$(curl -sk -H "Authorization: Bearer ${K8S_TOKEN}" \
+                    "${K8S_API}/apis/argoproj.io/v1alpha1/applications" 2>/dev/null \
+                    | python3 -c "
+                  import sys,json
+                  targets={'trident','crossplane-aws-infra'}
+                  try:
+                      for item in json.load(sys.stdin).get('items',[]):
+                          n=item['metadata']['name']
+                          if n in targets:
+                              print(item['metadata']['namespace']+'/'+n)
+                  except:
+                      pass
+                  " 2>/dev/null)
+
+                  if [ -n "${ARGO_APPS}" ]; then
+                    for APP in ${ARGO_APPS}; do
+                      APP_NS="${APP%%/*}"
+                      APP_NAME="${APP##*/}"
+                      HTTP=$(kube_refresh_argocd_app "${APP_NS}" "${APP_NAME}")
+                      echo "  Refreshed ${APP_NAME}: HTTP ${HTTP}"
+                    done
+                  else
+                    echo "  No matching ArgoCD apps found — skipping"
+                  fi
+
+                  echo ""
+                  echo "=== Watcher complete ==="
+              volumeMounts:
+                - name: aws-creds
+                  mountPath: /aws
+                  readOnly: true
+          volumes:
+            - name: aws-creds
+              secret:
+                secretName: {{ .Values.crossplane.providerConfig.credentials.secretName | default "aws-provider-creds" }}
+                items:
+                  - key: {{ .Values.crossplane.providerConfig.credentials.secretKey | default "credentials" }}
+                    path: credentials
+{{- end }}

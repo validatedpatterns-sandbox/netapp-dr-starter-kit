@@ -67,11 +67,41 @@ fsx_ontap_terraform_weekly_maintenance_time: "7:01:00"  # d:HH:MM (UTC)
 # svm_admin_password: ""
 
 # SVM Configuration
-fsx_ontap_terraform_svm_name: "SVM1"
+# Production gets SVM1, DR gets SVM2. Distinct names are required so that
+# ONTAP SnapMirror correctly resolves cross-cluster volume handles.
+# SVM names are set per-cluster in dr-setup.yaml (not here, because
+# extra-vars have the highest Ansible precedence and would override
+# the per-cluster values in the playbook).
+# fsx_ontap_terraform_svm_name: — set in dr-setup.yaml
 fsx_ontap_terraform_root_volume_security_style: "UNIX"
 
 # Secrets Manager
 fsx_ontap_terraform_create_secrets: true
+
+# -----------------------------------------------------------------------------
+# Route53 DR Failover
+# -----------------------------------------------------------------------------
+# Set dr_failover_domain to enable Route53 DNS failover for protected apps.
+# During failover, Route53 automatically routes traffic to the healthy cluster.
+# Leave empty to skip Route53 setup entirely.
+#
+# If you own the zone in Route53, set dr_failover_hosted_zone_id to the Z...
+# id, or use crossplane-setup discovery (dr_failover_discover_hosted_zone_id)
+# — see ansible/crossplane-vars.yml. Otherwise a new zone may be created and
+# you must delegate NS from the parent zone.
+dr_failover_domain: ""
+# dr_failover_hosted_zone_id: ""
+# dr_failover_hosted_zone_lookup_name: "aws.validatedpatterns.io"
+
+# Apps that get failover records (must match drFailover.apps in values-global.yaml)
+dr_failover_apps:
+  - name: boutique
+  - name: wordpress
+
+# Health check path hit by Route53 against each cluster's ingress router
+dr_failover_health_check_path: "/"
+# Route53 (Terraform dr-setup): omit secondary health check by default (same semantics as Crossplane).
+dr_failover_attach_secondary_health_check: false
 
 # -----------------------------------------------------------------------------
 # Tags

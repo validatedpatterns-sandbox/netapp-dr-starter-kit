@@ -1,0 +1,28 @@
+global:
+  clusterDomain: ""
+  drClusterDomain: ""
+
+drDnsReconciler:
+  enabled: false
+  # Argo PostSync Job: apply Route53 once right after sync (avoids NXDOMAIN until first CronJob tick).
+  postSyncJob: true
+  namespace: crossplane-system
+  schedule: "*/1 * * * *"
+  image: image-registry.openshift-image-registry.svc:5000/crossplane-system/dr-tools:latest
+  # Same secret shape as Crossplane AWS provider (INI in `credentials` key by default).
+  awsCredentialsSecret:
+    name: aws-provider-creds
+    namespace: crossplane-system
+    credentialsKey: credentials
+  s3Bucket: ""
+  s3Region: ""
+  s3Key: dr-metadata/amr-dns-target.json
+  hostedZoneId: ""
+  domain: ""
+  primaryIngressHostname: ""
+  secondaryIngressHostname: ""
+  recordTtl: 60
+  weightActive: 255
+  weightStandby: 0
+  apps: []
+  #  - name: wordpress

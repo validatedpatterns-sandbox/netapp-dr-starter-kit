@@ -1,19 +1,53 @@
 ---
 global:
   pattern: netapp-dr-starter-kit
+  # OpenShift ingress domains: oc get ingress.config cluster -o jsonpath='{.spec.domain}'
+  # Primary / DR — used for router-default.<domain> in Route53 unless overridden in values-hub.yaml.
+  clusterDomain: apps.cluster.example.com
+  drClusterDomain: apps.cluster.example.com
   options:
     useCSV: false
     syncPolicy: Automatic
     installPlanApproval: Automatic
-
-  tridentProtect:
-    appVault:
-      enabled: true
-      name: s3-appvault
-      s3:
-        bucketName: trident-protect-bucket
-        region: us-west-1
-
+tridentProtect:
+  appVault:
+    enabled: true
+    name: s3-appvault
+    s3:
+      bucketName: trident-protect-bucket-name
+      region: us-west-1
+  applications:
+    - name: boutique
+      namespaces:
+        - name: boutique
+    - name: wordpress
+      namespaces:
+        - name: wordpress
+# Route53 DR Failover — domain auto-derived by crossplane-setup from cluster DNS
+drFailover:
+  enabled: true
+  domain: "dr.example.com"
+  apps:
+    - name: boutique
+      routeName: frontend-dr
+      namespace: boutique
+      serviceName: frontend
+      servicePort: http
+    - name: wordpress
+      routeName: wordpress-dr
+      namespace: wordpress
+      serviceName: wordpress
+      servicePort: http
+crossplane:
+  providers:
+    version: v2.4.0
+  providerConfig:
+    name: default
+    credentials:
+      secretName: aws-provider-creds
+      secretNamespace: crossplane-system
+      secretKey: credentials
+      fromVault: true
 main:
   clusterGroupName: hub
   multiSourceConfig:

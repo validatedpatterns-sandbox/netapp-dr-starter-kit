@@ -1,0 +1,125 @@
+{{- if .Values.drDnsReconciler.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-dns-reconcile-script
+  namespace: {{ .Values.drDnsReconciler.namespace }}
+  labels:
+    {{- include "dr-dns-reconciler.labels" . | nindent 4 }}
+data:
+  reconcile.py: |
+    #!/usr/bin/env python3
+    """Apply per-app weighted CNAMEs from S3 AMR state (written by DR cluster)."""
+    import json, os, subprocess, sys, tempfile
+
+    ZONE_ID = os.environ["ROUTE53_HOSTED_ZONE_ID"]
+    DOMAIN = os.environ["ROUTE53_DOMAIN"].rstrip(".")
+    PRIMARY = os.environ["PRIMARY_INGRESS"].rstrip(".")
+    SECONDARY = os.environ["SECONDARY_INGRESS"].rstrip(".")
+    BUCKET = os.environ["S3_BUCKET"]
+    REGION = os.environ["S3_REGION"]
+    KEY = os.environ["S3_KEY"]
+    TTL = int(os.environ.get("ROUTE53_RECORD_TTL", "60"))
+    W_ON = int(os.environ.get("WEIGHT_ACTIVE", "255"))
+    W_OFF = int(os.environ.get("WEIGHT_STANDBY", "0"))
+    APPS = json.loads(os.environ.get("ROUTE53_APPS_JSON", "[]"))
+
+    def fqdn(name):
+        return f"{name}.{DOMAIN}."
+
+    def cval(host):
+        return host if host.endswith(".") else host + "."
+
+    def run_aws(args):
+        r = subprocess.run(["aws"] + args, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            raise SystemExit(r.returncode)
+        return r.stdout
+
+    st = tempfile.NamedTemporaryFile(mode="w+b", suffix=".json", delete=False)
+    state_path = st.name
+    st.close()
+    r = subprocess.run(
+        ["aws", "s3", "cp", f"s3://{BUCKET}/{KEY}", state_path, "--region", REGION],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(f"S3 read failed (treating all Established): {r.stderr}", file=sys.stderr)
+        blob = {}
+    else:
+        try:
+            with open(state_path) as f:
+                blob = json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            print(f"S3 state invalid or unreadable (treating all Established): {e}", file=sys.stderr)
+            blob = {}
+    try:
+        os.unlink(state_path)
+    except OSError:
+        pass
+
+    apps_map = (blob or {}).get("apps") or {}
+    changes = []
+
+    for app in APPS:
+        name = app["name"] if isinstance(app, dict) else app
+        raw = apps_map.get(name, "Established")
+        promoted = str(raw).strip().lower() == "promoted"
+        pw = W_OFF if promoted else W_ON
+        sw = W_ON if promoted else W_OFF
+        n = fqdn(name)
+        changes.append(
+            {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": n,
+                    "Type": "CNAME",
+                    "SetIdentifier": f"{name}-w-primary",
+                    "Weight": pw,
+                    "TTL": TTL,
+                    "ResourceRecords": [{"Value": cval(PRIMARY)}],
+                },
+            }
+        )
+        changes.append(
+            {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": n,
+                    "Type": "CNAME",
+                    "SetIdentifier": f"{name}-w-dr",
+                    "Weight": sw,
+                    "TTL": TTL,
+                    "ResourceRecords": [{"Value": cval(SECONDARY)}],
+                },
+            }
+        )
+
+    if not changes:
+        print("No apps configured (ROUTE53_APPS_JSON empty); skipping Route53")
+        sys.exit(0)
+
+    batch = {"Comment": "dr-dns-reconciler", "Changes": changes}
+    cb = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        json.dump(batch, cb)
+        cb.close()
+        run_aws(
+            [
+                "route53",
+                "change-resource-record-sets",
+                "--hosted-zone-id",
+                ZONE_ID,
+                "--change-batch",
+                f"file://{cb.name}",
+            ]
+        )
+        print(f"UPSERT {len(changes)} weighted record(s) for {len(APPS)} app(s)")
+    finally:
+        try:
+            os.unlink(cb.name)
+        except OSError:
+            pass
+{{- end }}

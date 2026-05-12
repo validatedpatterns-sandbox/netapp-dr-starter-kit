@@ -9,6 +9,11 @@ exclude_paths:
   - common/
   - tests/
 
+# Role `route53_failover_terraform` intentionally exposes `route53_failover_*` variables
+# to playbooks; renaming to `route53_failover_terraform_*` would be a breaking API change.
+skip_list:
+  - var-naming[no-role-prefix]
+
 # warn_list:
 #   - yaml
 #   - schema

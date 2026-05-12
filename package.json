@@ -1,0 +1,13 @@
+{
+  "name": "netapp-dr-starter-kit",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "NetApp DR starter kit. DevDependencies mirror GitHub super-linter Biome for local JSON/format checks.",
+  "scripts": {
+    "lint:biome": "biome check .",
+    "format:biome": "biome format --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.10"
+  }
+}
