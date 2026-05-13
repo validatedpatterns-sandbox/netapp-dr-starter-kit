@@ -58,6 +58,16 @@ cp values-secret.yaml.template ~/values-secret-netapp-dr-starter-kit.yaml
 printf '%s\n' 'YourSecurePassword' > ~/.fsx
 chmod 600 ~/.fsx
 
+# Define a s3 bucket name for the appVault
+vi values-global.yaml
+tridentProtect:
+  appVault:
+    enabled: true
+    name: s3-appvault
+    s3:
+      bucketName: '' # must provide a bucketName - if it doesn't exist, crossplane will create it.
+      region: us-west-1 # region in which the bucket resides
+
 # Install the Validated Pattern on a target cluster (from Makefile-common; uses Podman)
 ./pattern.sh make install
 ```
