@@ -42,6 +42,16 @@ Teardown is **`make destroy-dr`**, which runs `ansible/crossplane-destroy.yaml` 
 ## Quick start (Crossplane + pattern)
 
 ```bash
+# Define a s3 bucket name for the appVault
+vi values-global.yaml
+tridentProtect:
+  appVault:
+    enabled: true
+    name: s3-appvault
+    s3:
+      bucketName: '' # must provide a bucketName - if it doesn't exist, crossplane will create it.
+      region: us-west-1 # region in which the bucket resides
+
 # Discover both clusters and update Helm values in this repository
 ./pattern.sh make crossplane-setup \
   PROD_KUBECONFIG="${HOME}/.kube/kubeconfig-prod" \
@@ -57,16 +67,6 @@ cp values-secret.yaml.template ~/values-secret-netapp-dr-starter-kit.yaml
 # Create a file called ~/.fsx to use for your Ontap filesystem and SVM creation
 printf '%s\n' 'YourSecurePassword' > ~/.fsx
 chmod 600 ~/.fsx
-
-# Define a s3 bucket name for the appVault
-vi values-global.yaml
-tridentProtect:
-  appVault:
-    enabled: true
-    name: s3-appvault
-    s3:
-      bucketName: '' # must provide a bucketName - if it doesn't exist, crossplane will create it.
-      region: us-west-1 # region in which the bucket resides
 
 # Install the Validated Pattern on a target cluster (from Makefile-common; uses Podman)
 ./pattern.sh make install
